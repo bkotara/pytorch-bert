@@ -4,6 +4,7 @@ from tqdm import tqdm, trange
 from tempfile import TemporaryDirectory
 import shelve
 
+from multiprocessing import Pool, cpu_count
 from random import random, randrange, randint, shuffle, choice, sample
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 import numpy as np
@@ -132,13 +133,12 @@ def create_masked_lm_predictions(tokens, masked_lm_prob, max_predictions_per_seq
 
 
 def create_instances_from_document(
-        doc_database, doc_idx, max_seq_length, short_seq_prob,
+        document, random_document, max_seq_length, short_seq_prob,
         masked_lm_prob, max_predictions_per_seq, vocab_list):
     """This code is mostly a duplicate of the equivalent function from Google BERT's repo.
     However, we make some changes and improvements. Sampling is improved and no longer requires a loop in this function.
     Also, documents are sampled proportionally to the number of sentences they contain, which means each sentence
     (rather than each document) has an equal chance of being sampled as a false example for the NextSentence task."""
-    document = doc_database[doc_idx]
     # Account for [CLS], [SEP], [SEP]
     max_num_tokens = max_seq_length - 3
 
@@ -185,9 +185,6 @@ def create_instances_from_document(
                     is_random_next = True
                     target_b_length = target_seq_length - len(tokens_a)
 
-                    # Sample a random document, with longer docs being sampled more frequently
-                    random_document = doc_database.sample_doc(current_idx=doc_idx, sentence_weighted=True)
-
                     random_start = randrange(0, len(random_document))
                     for j in range(random_start, len(random_document)):
                         tokens_b.extend(random_document[j])
@@ -228,6 +225,20 @@ def create_instances_from_document(
 
     return instances
 
+def tokenizer_initializer(tokenizer):
+    global proc_tokenizer
+    proc_tokenizer = tokenizer
+
+def tokenize_raw_doc(doc):
+    return [token_line for token_line in [proc_tokenizer.tokenize(line) for line in doc] if len(token_line) > 0]
+
+def create_instances_initializer(vocab_list):
+    global proc_vocab_list
+    proc_vocab_list = vocab_list
+
+def create_instances(params):
+    doc_instances = create_instances_from_document(*params, proc_vocab_list)
+    return [json.dumps(instance) for instance in doc_instances]
 
 def main():
     parser = ArgumentParser()
@@ -250,45 +261,64 @@ def main():
                         help="Probability of masking each token for the LM task")
     parser.add_argument("--max_predictions_per_seq", type=int, default=20,
                         help="Maximum number of tokens to mask in each sequence")
+    parser.add_argument("--processes", type=int, default=cpu_count(),
+                        help="Number of processes to use for pregeneration")
+    parser.add_argument("--chunksize", type=int, default=10,
+                        help="# documents sent to each process at a time.")
 
     args = parser.parse_args()
 
     tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
     vocab_list = list(tokenizer.vocab.keys())
-    with DocumentDatabase(reduce_memory=args.reduce_memory) as docs:
+    def init_docs():
         with args.train_corpus.open() as f:
-            doc = []
+            raw_docs = []
+            raw_doc = []
             for line in tqdm(f, desc="Loading Dataset", unit=" lines"):
                 line = line.strip()
                 if line == "":
-                    docs.add_document(doc)
-                    doc = []
+                    if len(raw_doc) > 0:
+                        raw_docs.append(raw_doc)
+                    raw_doc = []
                 else:
-                    tokens = tokenizer.tokenize(line)
-                    doc.append(tokens)
-            if doc:
-                docs.add_document(doc)  # If the last doc didn't end on a newline, make sure it still gets added
-        if len(docs) <= 1:
+                    raw_doc.append(line)
+            if raw_doc:
+                raw_docs.append(raw_doc)  # If the last doc didn't end on a newline, make sure it still gets added
+
+        if len(raw_docs) < 1:
             exit("ERROR: No document breaks were found in the input file! These are necessary to allow the script to "
                  "ensure that random NextSentences are not sampled from the same document. Please add blank lines to "
                  "indicate breaks between documents in your input file. If your dataset does not contain multiple "
                  "documents, blank lines can be inserted at any natural boundary, such as the ends of chapters, "
                  "sections or paragraphs.")
 
-        args.output_dir.mkdir(exist_ok=True)
+        docs = DocumentDatabase(reduce_memory=args.reduce_memory)
+        with Pool(args.processes, tokenizer_initializer, initargs=(tokenizer,)) as p:
+            for tokenized_doc in tqdm(p.imap_unordered(tokenize_raw_doc, raw_docs, args.chunksize), total=len(raw_docs)):
+                docs.add_document(tokenized_doc)
+
+        return docs
+
+
+    args.output_dir.mkdir(exist_ok=True)
+    epoch_filename = args.output_dir / f"epoch_{epoch}.json"
+    with init_docs() as docs:
         for epoch in trange(args.epochs_to_generate, desc="Epoch"):
-            epoch_filename = args.output_dir / f"epoch_{epoch}.json"
-            num_instances = 0
-            with epoch_filename.open('w') as epoch_file:
-                for doc_idx in trange(len(docs), desc="Document"):
-                    doc_instances = create_instances_from_document(
-                        docs, doc_idx, max_seq_length=args.max_seq_len, short_seq_prob=args.short_seq_prob,
-                        masked_lm_prob=args.masked_lm_prob, max_predictions_per_seq=args.max_predictions_per_seq,
-                        vocab_list=vocab_list)
-                    doc_instances = [json.dumps(instance) for instance in doc_instances]
-                    for instance in doc_instances:
+            create_instances_from_document_params = [(
+                docs[doc_idx],
+                docs.sample_doc(current_idx=doc_idx, sentence_weighted=True), # Sample a random document, with longer docs being sampled more frequently
+                args.max_seq_len,
+                args.short_seq_prob,
+                args.masked_lm_prob,
+                args.max_predictions_per_seq
+                ) for doc_idx in range(len(docs))]
+            with Pool(args.processes, create_instances_initializer, initargs=(vocab_list,)) as p, epoch_filename.open('w') as epoch_file:
+                num_instances = 0
+                for instance_list in tqdm(p.imap_unordered(create_instances, create_instances_from_document_params, args.chunksize), total=len(docs)):
+                    for instance in instance_list:
                         epoch_file.write(instance + '\n')
                         num_instances += 1
+
             metrics_file = args.output_dir / f"epoch_{epoch}_metrics.json"
             with metrics_file.open('w') as metrics_file:
                 metrics = {

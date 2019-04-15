@@ -7,6 +7,7 @@ import random
 import numpy as np
 from collections import namedtuple
 from tempfile import TemporaryDirectory
+from multiprocessing import Pool, cpu_count
 
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -52,9 +53,20 @@ def convert_example_to_features(example, tokenizer, max_seq_length):
                              is_next=is_random_next)
     return features
 
+def example_gen_initializer(tokenizer, seq_len):
+    global proc_tokenizer, proc_seq_len
+    proc_tokenizer = tokenizer
+    proc_seq_len = seq_len
+
+def example_to_features_processor(line):
+    line = line.strip()
+    example = json.loads(line)
+    return convert_example_to_features(example, proc_tokenizer, proc_seq_len)
 
 class PregeneratedDataset(Dataset):
-    def __init__(self, training_path, epoch, tokenizer, num_data_epochs, reduce_memory=False):
+    def __init__(
+            self, training_path, epoch, tokenizer, num_data_epochs,
+            chunksize, reduce_memory=False, num_processes=cpu_count()):
         self.vocab = tokenizer.vocab
         self.tokenizer = tokenizer
         self.epoch = epoch
@@ -88,11 +100,8 @@ class PregeneratedDataset(Dataset):
             lm_label_ids = np.full(shape=(num_samples, seq_len), dtype=np.int32, fill_value=-1)
             is_nexts = np.zeros(shape=(num_samples,), dtype=np.bool)
         logging.info(f"Loading training examples for epoch {epoch}")
-        with data_file.open() as f:
-            for i, line in enumerate(tqdm(f, total=num_samples, desc="Training examples")):
-                line = line.strip()
-                example = json.loads(line)
-                features = convert_example_to_features(example, tokenizer, seq_len)
+        with Pool(num_processes, example_gen_initializer, initargs=(tokenizer, seq_len)) as p, data_file.open() as f:
+            for i, features in enumerate(tqdm(p.imap_unordered(example_to_features_processor, f, chunksize), total=num_samples, desc="Make training examples")):
                 input_ids[i] = features.input_ids
                 segment_ids[i] = features.segment_ids
                 input_masks[i] = features.input_mask
@@ -123,8 +132,9 @@ def main():
     parser = ArgumentParser()
     parser.add_argument('--pregenerated_data', type=Path, required=True)
     parser.add_argument('--output_dir', type=Path, required=True)
-    parser.add_argument("--bert_model", type=str, required=True, help="Bert pre-trained model selected in the list: bert-base-uncased, "
-                             "bert-large-uncased, bert-base-cased, bert-base-multilingual, bert-base-chinese.")
+    parser.add_argument("--bert_model", type=str, required=True,
+                        choices=["bert-base-uncased", "bert-large-uncased", "bert-base-cased",
+                                 "bert-base-multilingual", "bert-base-chinese"])
     parser.add_argument("--do_lower_case", action="store_true")
     parser.add_argument("--reduce_memory", action="store_true",
                         help="Store training data as on-disc memmaps to massively reduce memory usage")
@@ -166,6 +176,12 @@ def main():
                         type=int,
                         default=42,
                         help="random seed for initialization")
+    parser.add_argument('--processes',
+                        type=int,
+                        default=cpu_count(),
+                        help="# processes to run for feature extraction")
+    parser.add_argument("--chunksize", type=int, default=20,
+                        help="# documents sent to each process at a time.")
     args = parser.parse_args()
 
     assert args.pregenerated_data.is_dir(), \
@@ -283,7 +299,7 @@ def main():
     model.train()
     for epoch in range(args.epochs):
         epoch_dataset = PregeneratedDataset(epoch=epoch, training_path=args.pregenerated_data, tokenizer=tokenizer,
-                                            num_data_epochs=num_data_epochs)
+                                            num_data_epochs=num_data_epochs, chunksize=args.chunksize, num_processes=args.processes)
         if args.local_rank == -1:
             train_sampler = RandomSampler(epoch_dataset)
         else:
