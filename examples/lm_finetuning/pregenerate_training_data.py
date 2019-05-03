@@ -301,9 +301,9 @@ def main():
 
 
     args.output_dir.mkdir(exist_ok=True)
-    epoch_filename = args.output_dir / f"epoch_{epoch}.json"
     with init_docs() as docs:
         for epoch in trange(args.epochs_to_generate, desc="Epoch"):
+            epoch_filename = args.output_dir / f"epoch_{epoch}.json"
             create_instances_from_document_params = [(
                 docs[doc_idx],
                 docs.sample_doc(current_idx=doc_idx, sentence_weighted=True), # Sample a random document, with longer docs being sampled more frequently
